@@ -68,6 +68,8 @@ At B Monte Carlo draws the smallest probability is 1/(B+1). For sparse BH discov
 
 Every outer fold fits confound normalization, feature nuisance coefficients, target nuisance coefficients, feature scaling and regression weights on its training subjects. Test rows are only transformed and scored. `fold_audits_` exposes the stored training state. Tests change held-out targets, features and confounds and prove that the corresponding training weights stay identical.
 
+Nuisance regression uses one explicit SVD cutoff of machine precision times the larger training-design dimension times its largest singular value. The retained orthonormal basis controls training projections, reported nuisance rank and screening degrees of freedom. Held-out transformations and null refits use those same retained directions. Fold audits also expose the basis, coefficient map and absolute cutoff.
+
 Ridge uses a fixed positive alpha and a dual solve when the edge count exceeds the training subject count. The partial-correlation model screens edges inside each training fold, constructs positive and negative edge sums, and fits ridge to those sums. It follows the structure of connectome predictive modeling while adding explicit nuisance and fold boundaries. Hyperparameters are fixed before evaluation. Select them with a nested training-only procedure if tuning is needed.
 
 Prediction includes a demographics/confounds baseline. Report the baseline MSE, full-model MSE and their difference. A large raw prediction correlation can come entirely from age or site. Residual prediction correlation is also available.
@@ -82,6 +84,8 @@ For family or repeated-measure data, `groups` keeps independent units together d
 
 `pulse_pressure` returns systolic minus diastolic pressure in mmHg. `rmssd` computes successive accepted NN-interval differences and returns milliseconds. It requires prior artifact review and performs no ECG peak detection. `neurovascular_features` appends physiology and raw segregation interactions without fitting a cohort-wide scaler. `motion_sensitivity` compares adjusted correlations before and after FD control and can run both corresponding permutation tests. Attenuation describes sensitivity to an added confound; it is not causal evidence.
 
+When predicting pulse pressure, exclude `pulse_pressure_mmhg` and all `_x_pulse_pressure` columns from `neurovascular_features`. When predicting RMSSD, exclude `rmssd_ms` and all `_x_rmssd` columns. Remove every predictor derived from the outcome before CV. Training-only preprocessing cannot repair a predictor that contains the target.
+
 ## CLI
 
 ```sh
@@ -92,7 +96,7 @@ nvperm benchmark --output benchmark.json --csv null_replicates.csv \
   --figure calibration.png --replicates 80 --permutations 199
 ```
 
-The NPZ requires `features`, `target`, and `confounds` numeric arrays. For no confounds, supply an empty array of shape `(subjects, 0)`. Optional arrays are `fold_ids`, `blocks` and `groups`. Pickled objects are never loaded. Validation checks dimensions and finite values; scientific QC, category encoding, missing-data handling and consent remain study responsibilities. Site indicators should use declared reference categories. This package does not infer site categories from participant identifiers.
+The NPZ requires `features`, `target`, and `confounds` numeric arrays. For no confounds, supply an empty array of shape `(subjects, 0)`. Optional arrays are `fold_ids`, `blocks` and `groups`. Each must be a one-dimensional vector with one finite, non-missing label per subject. Nonempty string labels are supported. Supplied folds must contain at least two nonempty folds and keep each independent group intact. Each training fold needs at least four subjects. `validate --folds` and `--seed` mirror the corresponding run options when folds are generated. Pickled objects, NPY arrays and corrupt or empty archives are rejected. Validation checks dimensions, finite values and label compatibility; scientific QC, category encoding, missing-data handling and consent remain study responsibilities. Site indicators should use declared reference categories. This package does not infer site categories from participant identifiers.
 
 JSON outputs include the schema version, seed, adjusted inference, predictions, fold labels and null scores. CSV exports contain one row per target with coefficient, statistic, raw p, max-T p and BH q. Errors exit with code 2. Omitting `--output` writes JSON to standard output.
 

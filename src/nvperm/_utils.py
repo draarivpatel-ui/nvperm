@@ -46,20 +46,28 @@ def generator(random_state):
     return np.random.default_rng(random_state)
 
 
-def label_groups(labels, n):
+def label_groups(labels, n, *, name="block labels"):
     if labels is None:
         return [np.arange(n)]
     a = np.asarray(labels)
-    if a.ndim != 1 or len(a) != n:
-        raise ValueError("block labels must have one entry per subject")
+    if a.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional subject vector")
+    if len(a) != n:
+        raise ValueError(f"{name} has a different number of subjects")
+    if a.dtype.kind in "biufc" and not np.all(np.isfinite(a)):
+        raise ValueError(f"{name} must not be missing or non-finite")
+    if a.dtype.kind in "mM" and np.any(np.isnat(a)):
+        raise ValueError(f"{name} must not be missing")
     groups = {}
     for i, label in enumerate(a.tolist()):
-        if label is None or (isinstance(label, float) and not np.isfinite(label)):
-            raise ValueError("block labels must not be missing")
+        if (label is None
+                or (isinstance(label, (float, complex)) and not np.isfinite(label))
+                or (isinstance(label, (str, bytes)) and not label.strip())):
+            raise ValueError(f"{name} must not be missing or non-finite")
         try:
             groups.setdefault(label, []).append(i)
         except TypeError as exc:
-            raise ValueError("block labels must be scalar and hashable") from exc
+            raise ValueError(f"{name} must be scalar and hashable") from exc
     return [np.asarray(indices, dtype=int) for indices in groups.values()]
 
 
@@ -71,6 +79,20 @@ def permutation_indices(rng, groups, count, n):
     return indices
 
 
+def nuisance_svd(design):
+    """Retain one nuisance space using eps * max(shape) * largest singular value.
+
+    Return its orthonormal training basis, the map from basis scores to design
+    coefficients, and the absolute tolerance. Applying a held-out design to
+    that same map extends only the retained directions; no second cutoff is
+    used for fitting, rank reporting or prediction.
+    """
+    u, s, vt = np.linalg.svd(design, full_matrices=False)
+    tolerance = float(np.finfo(float).eps * max(design.shape) * s[0])
+    rank = int(np.count_nonzero(s > tolerance))
+    return u[:, :rank], vt[:rank].T / s[:rank], tolerance
+
+
 def nuisance_basis(covariates, n):
     """Return an intercept-containing, rank-aware orthonormal nuisance basis."""
     c = np.empty((n, 0)) if covariates is None else matrix(covariates, "covariates", n)
@@ -80,10 +102,8 @@ def nuisance_basis(covariates, n):
         scale = np.where(scale > 0, scale, 1.0)
         c = (c - mean) / scale
     design = np.column_stack((np.ones(n), c))
-    u, s, _ = np.linalg.svd(design, full_matrices=False)
-    tolerance = np.finfo(float).eps * max(design.shape) * s[0]
-    rank = int(np.count_nonzero(s > tolerance))
-    return u[:, :rank], rank
+    q, _, _ = nuisance_svd(design)
+    return q, q.shape[1]
 
 
 def residualize(value, q):

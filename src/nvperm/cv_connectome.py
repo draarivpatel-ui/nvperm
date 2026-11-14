@@ -13,7 +13,7 @@ from scipy.stats import t as student_t
 
 from ._utils import (
     correlation, generator, label_groups, matrix, permutation_indices,
-    positive_integer, vector,
+    nuisance_svd, positive_integer, vector,
 )
 
 
@@ -30,6 +30,9 @@ class FoldAudit:
     weights: np.ndarray
     selected_features: np.ndarray
     nuisance_rank: int
+    nuisance_basis: np.ndarray
+    nuisance_transform: np.ndarray
+    nuisance_tolerance: float
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,7 @@ def make_folds(n, n_splits=5, *, random_state=42, groups=None):
         for fold, indices in enumerate(np.array_split(rng.permutation(n), count)):
             folds[indices] = fold
     else:
-        cells = label_groups(groups, n)
+        cells = label_groups(groups, n, name="groups")
         if len(cells) < count:
             raise ValueError("there must be at least n_splits independent groups")
         sizes = np.zeros(count, dtype=int)
@@ -99,6 +102,26 @@ def make_folds(n, n_splits=5, *, random_state=42, groups=None):
             fold = int(np.argmin(sizes))
             folds[cells[index]] = fold
             sizes[fold] += len(cells[index])
+    return folds
+
+
+def validate_folds(n, fold_ids=None, *, n_splits=5, random_state=42, groups=None):
+    """Validate subject labels and group isolation and return numeric folds."""
+    if fold_ids is None:
+        folds = make_folds(n, n_splits, random_state=random_state, groups=groups)
+    else:
+        cells = label_groups(fold_ids, n, name="fold_ids")
+        if len(cells) < 2:
+            raise ValueError("at least two nonempty folds are required")
+        folds = np.empty(n, int)
+        for i, cell in enumerate(cells):
+            folds[cell] = i
+        if groups is not None:
+            for group in label_groups(groups, n, name="groups"):
+                if len(np.unique(folds[group])) != 1:
+                    raise ValueError("an independent group crosses held-out folds")
+    if any(np.count_nonzero(folds != fold) < 4 for fold in np.unique(folds)):
+        raise ValueError("each training fold needs at least four subjects")
     return folds
 
 
@@ -125,19 +148,8 @@ class ConnectomePhysiologyCV:
         self.selection_p, self.random_state = float(selection_p), random_state
 
     def _folds(self, n, fold_ids, groups):
-        if fold_ids is None:
-            return make_folds(n, self.n_splits, random_state=self.random_state, groups=groups)
-        cells = label_groups(fold_ids, n)
-        if len(cells) < 2:
-            raise ValueError("at least two nonempty folds are required")
-        folds = np.empty(n, int)
-        for i, cell in enumerate(cells):
-            folds[cell] = i
-        if groups is not None:
-            for group in label_groups(groups, n):
-                if len(np.unique(folds[group])) != 1:
-                    raise ValueError("an independent group crosses held-out folds")
-        return folds
+        return validate_folds(n, fold_ids, n_splits=self.n_splits,
+                              random_state=self.random_state, groups=groups)
 
     def _fit_weights(self, xtrain, ytrain, nuisance_rank):
         p = xtrain.shape[1]
@@ -179,35 +191,37 @@ class ConnectomePhysiologyCV:
         audits, cached = [], []
         for fold in np.unique(folds):
             train, test = np.flatnonzero(folds != fold), np.flatnonzero(folds == fold)
-            if len(train) < 4:
-                raise ValueError("each training fold needs at least four subjects")
             cmean = c[train].mean(axis=0)
             cscale = c[train].std(axis=0)
             cscale = np.where(cscale > 0, cscale, 1)
             ctr = np.column_stack((np.ones(len(train)), (c[train] - cmean) / cscale))
             cte = np.column_stack((np.ones(len(test)), (c[test] - cmean) / cscale))
-            rank = int(np.linalg.matrix_rank(ctr))
+            q, transform, tolerance = nuisance_svd(ctr)
+            rank = q.shape[1]
             if len(train) - rank < 3:
                 raise ValueError("training nuisance design leaves too few residual degrees of freedom")
-            pinv = np.linalg.pinv(ctr)
-            coefx, coefy = pinv @ x[train], pinv @ y[train]
-            xtr, xte = x[train] - ctr @ coefx, x[test] - cte @ coefx
-            ytr = y[train] - ctr @ coefy
+            heldout_basis = cte @ transform
+            scoresx, scoresy = q.T @ x[train], q.T @ y[train]
+            coefx, coefy = transform @ scoresx, transform @ scoresy
+            xtr = x[train] - q @ scoresx
+            xte = x[test] - heldout_basis @ scoresx
+            ytr = y[train] - q @ scoresy
             mean, scale = xtr.mean(axis=0), xtr.std(axis=0)
             precision = 100 * np.finfo(float).eps * np.maximum(np.max(np.abs(x[train]), axis=0), np.finfo(float).tiny)
             scale = np.where(scale > precision, scale, 1)
             xtr, xte = (xtr - mean) / scale, (xte - mean) / scale
             weights, selected = self._fit_weights(xtr, ytr, rank)
-            baseline[test] = cte @ coefy
+            baseline[test] = heldout_basis @ scoresy
             predictions[test] = baseline[test] + xte @ weights
             audits.append(FoldAudit(
                 train.copy(), test.copy(), cmean.copy(), cscale.copy(), coefx.copy(),
                 coefy.copy(), mean.copy(), scale.copy(), weights.copy(), selected.copy(), rank,
+                q.copy(), transform.copy(), tolerance,
             ))
             # No cached fitting operation depends on held-out values or targets.
-            cached.append({"train": train, "test": test, "ctr": ctr, "cte": cte,
-                           "pinv": pinv, "xtr": xtr, "xte": xte,
-                           "coefy": coefy, "rank": rank})
+            cached.append({"train": train, "test": test, "q": q,
+                           "heldout_basis": heldout_basis, "xtr": xtr, "xte": xte,
+                           "scoresy": scoresy, "rank": rank})
         mse = float(np.mean((y - predictions) ** 2))
         baseline_mse = float(np.mean((y - baseline) ** 2))
         improvement = baseline_mse - mse
@@ -243,17 +257,18 @@ class ConnectomePhysiologyCV:
         scores = np.zeros(count)
         for state in self._cached:
             train, test = state["train"], state["test"]
-            ctr, cte, coefy = state["ctr"], state["cte"], state["coefy"]
+            q, heldout_basis = state["q"], state["heldout_basis"]
             reduced = np.empty(n)
-            reduced[train], reduced[test] = ctr @ coefy, cte @ coefy
+            reduced[train] = q @ state["scoresy"]
+            reduced[test] = heldout_basis @ state["scoresy"]
             residuals = self._target - reduced
             for b, index in enumerate(indices):
                 pseudo_train = reduced[train] + residuals[index[train]]
                 pseudo_test = reduced[test] + residuals[index[test]]
-                new_coef = state["pinv"] @ pseudo_train
-                ytrain = pseudo_train - ctr @ new_coef
+                new_scores = q.T @ pseudo_train
+                ytrain = pseudo_train - q @ new_scores
                 weights, _ = self._fit_weights(state["xtr"], ytrain, state["rank"])
-                base = cte @ new_coef
+                base = heldout_basis @ new_scores
                 predicted = base + state["xte"] @ weights
                 scores[b] += np.sum((pseudo_test - base) ** 2 - (pseudo_test - predicted) ** 2) / n
         observed = self.result_.mse_improvement

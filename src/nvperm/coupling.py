@@ -119,6 +119,10 @@ def neurovascular_features(connectivity, labels, systolic, diastolic, *, rr_inte
 
     No centering or scaling is fit here, so extraction may precede fold splitting.
     Interactions describe joint variation; they do not establish causal coupling.
+    When predicting pulse pressure, exclude pulse_pressure_mmhg and all
+    *_x_pulse_pressure columns. When predicting RMSSD, exclude rmssd_ms and all
+    *_x_rmssd columns. A target or any predictor derived from it must be removed
+    before CV; training-only transformations cannot remove this target leakage.
     """
     network = network_features(connectivity, labels)
     pp = pulse_pressure(systolic, diastolic)

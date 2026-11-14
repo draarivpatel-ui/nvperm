@@ -6,11 +6,13 @@ import csv
 import json
 from pathlib import Path
 import sys
+import zipfile
 import numpy as np
+from numpy.lib.npyio import NpzFile
 
-from ._utils import matrix, vector
+from ._utils import label_groups, matrix, vector
 from .benchmark import plot_benchmark, run_benchmark, write_benchmark_csv
-from .cv_connectome import ConnectomePhysiologyCV
+from .cv_connectome import ConnectomePhysiologyCV, validate_folds
 from .freedman_lane import freedman_lane
 
 
@@ -25,7 +27,10 @@ def _write_json(value, path):
 
 
 def _load(path):
-    with np.load(path, allow_pickle=False) as dataset:
+    dataset = np.load(path, allow_pickle=False)
+    if not isinstance(dataset, NpzFile):
+        raise ValueError("input must be an NPZ archive containing named arrays")
+    with dataset:
         required = {"features", "target", "confounds"}
         if not required.issubset(dataset.files):
             raise ValueError("NPZ requires features, target, and confounds arrays")
@@ -35,6 +40,10 @@ def _load(path):
         if x.shape[1] == 0:
             raise ValueError("features must contain at least one column")
         extras = {key: dataset[key].copy() for key in ("fold_ids", "blocks", "groups") if key in dataset.files}
+        for name, labels in extras.items():
+            label_groups(labels, len(y), name=name)
+        if "fold_ids" in extras:
+            validate_folds(len(y), extras["fold_ids"], groups=extras.get("groups"))
     return x, y, c, extras
 
 
@@ -54,9 +63,11 @@ def build_parser():
     run.add_argument("--model", choices=("ridge", "partial_correlation"), default="ridge")
     run.add_argument("--statistic", choices=("studentized", "hc3", "partial_correlation"), default="studentized")
     run.add_argument("--exact", action="store_true")
-    validate = commands.add_parser("validate", help="Validate finite numeric NPZ arrays")
+    validate = commands.add_parser("validate", help="Validate NPZ arrays and subject labels")
     validate.add_argument("--input", required=True, type=Path)
     validate.add_argument("--output", type=Path)
+    validate.add_argument("--folds", type=int, default=5)
+    validate.add_argument("--seed", type=int, default=42)
     benchmark = commands.add_parser("benchmark", help="Synthetic calibration and leakage experiment")
     benchmark.add_argument("--output", type=Path)
     benchmark.add_argument("--csv", type=Path)
@@ -86,6 +97,8 @@ def main(argv=None):
             return 0
         x, y, c, extras = _load(args.input)
         if args.command == "validate":
+            validate_folds(len(y), extras.get("fold_ids"), n_splits=args.folds,
+                           random_state=args.seed, groups=extras.get("groups"))
             _write_json({"status": "PASS", "n_subjects": len(y), "n_features": x.shape[1],
                          "n_confounds": c.shape[1], "finite": True}, args.output)
             return 0
@@ -103,11 +116,13 @@ def main(argv=None):
         if args.csv:
             args.csv.parent.mkdir(parents=True, exist_ok=True)
             with args.csv.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
+                writer = csv.writer(handle, lineterminator="\n")
                 writer.writerow(["feature", "effect", "statistic", "pvalue", "pvalue_max_t", "qvalue"])
                 writer.writerows(zip(range(x.shape[1]), fl.effect, fl.statistic, fl.pvalues, fl.pvalues_max_t, fl.qvalues))
         _write_json(report, args.output)
         return 0
-    except (ValueError, OSError, ImportError, np.linalg.LinAlgError) as exc:
-        parser.exit(2, f"nvperm error: {exc}\n")
+    except (ValueError, OSError, EOFError, zipfile.BadZipFile,
+            ImportError, np.linalg.LinAlgError) as exc:
+        message = str(exc) or type(exc).__name__
+        parser.exit(2, f"nvperm error: {message}\n")
 
