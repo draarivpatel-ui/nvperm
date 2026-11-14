@@ -1,0 +1,9 @@
+include README.md LICENSE CONTRIBUTING.md CODE_OF_CONDUCT.md CHANGELOG.md
+recursive-include tests *.py
+recursive-include examples *.py *.json *.csv
+recursive-include benchmarks *.json *.csv
+recursive-include paper *.md *.bib *.png
+recursive-include .github/workflows *.yml
+global-exclude *.py[cod]
+global-exclude .DS_Store
+
