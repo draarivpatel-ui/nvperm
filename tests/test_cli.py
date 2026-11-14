@@ -162,6 +162,35 @@ def test_cli_recognized_archive_errors_are_clean(monkeypatch, capsys, error_type
     assert "broken input" in error
 
 
+@pytest.mark.parametrize("command", ["validate", "run"])
+def test_corrupt_compressed_npz_member_subprocess_exits_2(tmp_path, command):
+    import struct
+    path = tmp_path / "corrupt_deflate.npz"
+    rng = np.random.default_rng(70)
+    np.savez_compressed(
+        path,
+        features=rng.normal(size=(24, 3)),
+        target=rng.normal(size=24),
+        confounds=np.empty((24, 0)),
+    )
+    with zipfile.ZipFile(path) as archive:
+        member = archive.getinfo("features.npy")
+    assert member.compress_type == zipfile.ZIP_DEFLATED
+    raw = bytearray(path.read_bytes())
+    fn_len, extra_len = struct.unpack_from("<HH", raw, member.header_offset + 26)
+    data_offset = member.header_offset + 30 + fn_len + extra_len
+    raw[data_offset] = 0x07
+    path.write_bytes(bytes(raw))
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    cmd = [sys.executable, "-m", "nvperm", command, "--input", str(path)]
+    if command == "run":
+        cmd.extend(["--permutations", "9", "--cv-permutations", "3"])
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    assert proc.returncode == 2, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "nvperm error:" in proc.stderr
+
+
 def test_cli_does_not_hide_programming_errors(monkeypatch):
     def broken_loader(*args, **kwargs):
         raise TypeError("unexpected programming error")

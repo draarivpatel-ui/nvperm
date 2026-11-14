@@ -5,8 +5,10 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import struct
 import sys
 import zipfile
+import zlib
 import numpy as np
 from numpy.lib.npyio import NpzFile
 
@@ -122,7 +124,7 @@ def main(argv=None):
         _write_json(report, args.output)
         return 0
     except (ValueError, OSError, EOFError, zipfile.BadZipFile,
-            ImportError, np.linalg.LinAlgError) as exc:
+            zlib.error, struct.error, ImportError, np.linalg.LinAlgError) as exc:
         message = str(exc) or type(exc).__name__
         parser.exit(2, f"nvperm error: {message}\n")
 
