@@ -24,7 +24,9 @@ bibliography: paper.bib
 
 Neurovascular studies relate multiple connectivity edges with hemodynamic variables such as blood pressure or heart rate variability while adjusting for nuisance variables including age, sex, motion artifacts and site. Motion artifacts can induce systematic artifacts in connectivity data [@power2012] and association with demographics can dominate in predictive models without providing useful information about connectivity. Valid inference requires retaining nuisance structure during permutation and fitting preprocessing only within training folds. Separate implementations leave opportunities for leakage.
 
-This module provides clear separation between each boundary via a common API. Adjusted p-values, out-of-fold predictions, nuisance-only baseline, null values and fold information during training are returned. # State of the field
+This module provides clear separation between each boundary via a common API. Adjusted p-values, out-of-fold predictions, nuisance-only baseline, null values and fold information during training are returned.
+
+# State of the field
 
 Nilearn provides neuroimaging, machine learning and mass-univariate capabilities [@abraham2014]. Pingouin provides convenient statistical tests, including partial correlations [@vallat2018]. BrainSpace provides macroscale gradient analysis and connectome tools [@vosdewael2020]. SciPy supplies numerical methods and `scipy.stats.permutation_test`, which accepts custom statistics for resampling problems [@virtanen2020]. `nvperm` complements these packages by providing an efficient array-based API that allows common nuisance permutation across edges, auditable connectome prediction with training-only nuisance fitting and a matching null distribution using fold-specific permutations. This package does not provide image preprocessing, gradient analysis or a general statistics library. The signed network predictor follows connectome prediction principles [@shen2017] with clear nuisance handling and outer-fold restrictions.
 
