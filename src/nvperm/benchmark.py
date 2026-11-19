@@ -77,7 +77,7 @@ def run_benchmark(*, n_replicates=80, n_permutations=199, n_subjects=90, n_rois=
         })
     levels = (0.0, 0.3, 0.6, 1.0)
     power_reps = max(12, repetitions // 2)
-    for level_index, effect in enumerate(levels):
+    for effect in levels:
         for i in range(power_reps):
             seed = int(random_state) + 30000 + i  # Paired random cohorts across effect levels.
             cohort = generate_cohort(n_subjects, n_rois, effect_size=effect,
