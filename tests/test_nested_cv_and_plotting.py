@@ -245,10 +245,29 @@ def test_forest_draws_intervals_by_endpoints(plt):
     from matplotlib.collections import LineCollection
     result = _permutation_result()
     intervals = types.SimpleNamespace(
+        effect=result.effect.copy(),
         ci_low=result.effect - 0.1, ci_high=result.effect + 0.1)
     intervals.ci_low[0], intervals.ci_high[0] = 0.5, 0.7
     ax = plotting.plot_adjusted_effects(result, intervals=intervals, kind="forest")
     assert any(isinstance(c, LineCollection) for c in ax.collections)
+
+
+def test_forest_rejects_reordered_or_mismatched_intervals():
+    result = _permutation_result()
+    reversed_intervals = types.SimpleNamespace(
+        effect=result.effect[::-1].copy(),
+        ci_low=result.effect[::-1] - 0.1,
+        ci_high=result.effect[::-1] + 0.1,
+    )
+    with pytest.raises(ValueError, match="intervals.effect"):
+        plotting.plot_adjusted_effects(result, intervals=reversed_intervals, kind="forest")
+    shifted_intervals = types.SimpleNamespace(
+        effect=result.effect + 0.05,
+        ci_low=result.effect - 0.1,
+        ci_high=result.effect + 0.1,
+    )
+    with pytest.raises(ValueError, match="intervals.effect"):
+        plotting.plot_adjusted_effects(result, intervals=shifted_intervals, kind="forest")
 
 
 def test_volcano_uses_finite_heights_without_raw_threshold(plt):
@@ -274,13 +293,66 @@ def test_adjusted_effects_rejects_invalid_inputs(kwargs):
 def test_adjusted_effects_validates_intervals():
     result = _permutation_result()
     for intervals in (
-        types.SimpleNamespace(ci_low=np.zeros(5), ci_high=np.ones(5)),
-        types.SimpleNamespace(ci_low=np.zeros(6), ci_high=np.full(6, np.inf)),
-        types.SimpleNamespace(ci_low=np.ones(6), ci_high=np.zeros(6)),
-        types.SimpleNamespace(ci_low=np.zeros(6)),
+        types.SimpleNamespace(effect=result.effect[:5], ci_low=np.zeros(5), ci_high=np.ones(5)),
+        types.SimpleNamespace(effect=result.effect, ci_low=np.zeros(6), ci_high=np.full(6, np.inf)),
+        types.SimpleNamespace(effect=result.effect, ci_low=np.ones(6), ci_high=np.zeros(6)),
+        types.SimpleNamespace(effect=result.effect, ci_low=np.zeros(6)),
+        types.SimpleNamespace(ci_low=result.effect - 0.1, ci_high=result.effect + 0.1),
     ):
         with pytest.raises(ValueError):
             plotting.plot_adjusted_effects(result, intervals=intervals)
+
+
+def test_cv_permutation_pvalue_is_scale_invariant():
+    x = np.tile([-1.0, 1.0], 12)[:, None]
+    y = x[:, 0].copy()
+    fold_ids = np.repeat(np.arange(3), 8)
+    for kwargs in ({"alpha": 1.0}, {"alpha_grid": (0.1, 1.0, 10.0), "inner_splits": 2}):
+        base_cv = ConnectomePhysiologyCV(n_splits=3, random_state=7, **kwargs).fit(
+            x, y, fold_ids=fold_ids
+        )
+        small_cv = ConnectomePhysiologyCV(n_splits=3, random_state=7, **kwargs).fit(
+            x, 1e-6 * y, fold_ids=fold_ids
+        )
+        p_base = base_cv.permutation_test(49, random_state=11).pvalue
+        p_small = small_cv.permutation_test(49, random_state=11).pvalue
+        assert p_base == p_small
+        assert p_small < 0.1
+
+
+def test_nested_ridge_handles_duplicate_columns_with_tiny_alpha():
+    rng = np.random.default_rng(19)
+    col = rng.normal(size=24)
+    x = np.column_stack([col, col])
+    y = 1.5 * col + 0.2 * rng.normal(size=24)
+    fold_ids = np.repeat(np.arange(3), 8)
+    cv = ConnectomePhysiologyCV(
+        n_splits=3, alpha_grid=(1e-16, 1.0), inner_splits=2, random_state=5
+    ).fit(x, y, fold_ids=fold_ids)
+    assert np.isfinite(cv.result_.mse)
+    assert np.isfinite(cv.result_.mse_improvement)
+    assert all(audit.selected_alpha in (1e-16, 1.0) for audit in cv.fold_audits_)
+
+
+def test_cv_scaled_mse_handles_large_targets_and_rejects_true_overflow():
+    x = np.zeros((12, 1))
+    y_large = np.tile([-4e153, 4e153], 6)
+    fold_ids = np.repeat(np.arange(3), 4)
+    cv = ConnectomePhysiologyCV(n_splits=3, alpha=1.0, random_state=3).fit(
+        x, y_large, fold_ids=fold_ids
+    )
+    assert np.isfinite(cv.result_.mse)
+    assert np.isfinite(cv.result_.baseline_mse)
+    assert np.isfinite(cv.result_.mse_improvement)
+    perm = cv.permutation_test(9, random_state=3)
+    assert np.all(np.isfinite(perm.null_scores))
+    assert np.isfinite(perm.pvalue)
+
+    y_overflow = np.tile([-1e200, 1e200], 6)
+    with pytest.raises(ValueError, match="not finite"):
+        ConnectomePhysiologyCV(n_splits=3, alpha=1.0, random_state=3).fit(
+            x, y_overflow, fold_ids=fold_ids
+        )
 
 
 def test_adjusted_effects_rejects_nonfinite_or_out_of_range():

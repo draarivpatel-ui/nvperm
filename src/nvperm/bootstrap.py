@@ -102,10 +102,9 @@ class _PreparedDesign:
     q: NDArray[np.float64]
     rank: int
     df: int
-    exposure_scale: float
     exposure_residual: NDArray[np.float64]
     exposure_ssr: float
-    outcome_scale: NDArray[np.float64]
+    scale_ratio: NDArray[np.float64]
     outcome_residuals: NDArray[np.float64]
     beta_conditioned: NDArray[np.float64]
     effect: NDArray[np.float64]
@@ -125,24 +124,38 @@ def _confidence_level(value: object) -> float:
 def _exposure_terms(exposure: NDArray[np.float64], q: NDArray[np.float64]):
     """Unit-sd nuisance-residualized exposure, or None if unidentifiable."""
     n = len(exposure)
-    centered = exposure - exposure.mean()
-    scale = float(np.linalg.norm(centered) / np.sqrt(n))
-    if scale == 0.0:
+    max_abs = float(np.max(np.abs(exposure)))
+    if max_abs == 0.0:
         return None
-    residual = residualize(centered / scale, q)
+    unit = exposure / max_abs
+    centered = unit - unit.mean()
+    norm_unit = float(np.linalg.norm(centered) / np.sqrt(n))
+    if norm_unit == 0.0:
+        return None
+    residual = residualize(centered / norm_unit, q)
     ssr = float(residual @ residual)
     if ssr <= np.finfo(float).eps * n:
         return None
-    return scale, residual, ssr
+    return max_abs, norm_unit, residual, ssr
 
 
 def _conditioned_outcomes(outcomes: NDArray[np.float64],
                           q: NDArray[np.float64]):
-    """Unit-variance nuisance residuals plus the per-outcome scale factor."""
-    scale = outcomes.std(axis=0)
-    scale = np.where(scale > 0, scale, 1.0)
-    residuals = residualize((outcomes - outcomes.mean(axis=0)) / scale, q)
-    return residuals, scale
+    """Unit-variance nuisance residuals plus overflow-safe scale factors."""
+    max_abs = np.max(np.abs(outcomes), axis=0)
+    safe_max = np.where(max_abs > 0.0, max_abs, 1.0)
+    unit = outcomes / safe_max
+    centered = unit - unit.mean(axis=0)
+    norm_unit = np.sqrt(np.mean(centered * centered, axis=0))
+    safe_norm = np.where(norm_unit > 0.0, norm_unit, 1.0)
+    residuals = residualize(centered / safe_norm, q)
+    return residuals, safe_max, safe_norm
+
+
+def _scale_ratio(y_max: NDArray[np.float64], y_norm: NDArray[np.float64],
+                 x_max: float, x_norm: float) -> NDArray[np.float64]:
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        return (y_max / x_max) * (y_norm / x_norm)
 
 
 def _prepare(y: ArrayLike, x: ArrayLike,
@@ -163,15 +176,17 @@ def _prepare(y: ArrayLike, x: ArrayLike,
     if terms is None:
         raise ValueError(
             "exposure is constant or collinear with nuisance covariates")
-    exposure_scale, exposure_residual, exposure_ssr = terms
-    residuals, scale = _conditioned_outcomes(outcomes, q)
+    x_max, x_norm, exposure_residual, exposure_ssr = terms
+    residuals, y_max, y_norm = _conditioned_outcomes(outcomes, q)
+    ratio = _scale_ratio(y_max, y_norm, x_max, x_norm)
     beta_conditioned = exposure_residual @ residuals / exposure_ssr
-    effect = beta_conditioned * scale / exposure_scale
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        effect = beta_conditioned * ratio
     if not np.all(np.isfinite(effect)):
         raise ValueError("observed exposure effect is not finite")
     return _PreparedDesign(
-        n, outcomes, exposure, covar, q, rank, df, exposure_scale,
-        exposure_residual, exposure_ssr, scale, residuals,
+        n, outcomes, exposure, covar, q, rank, df,
+        exposure_residual, exposure_ssr, ratio, residuals,
         beta_conditioned, effect)
 
 
@@ -233,11 +248,12 @@ def bootstrap_effects(
                  if rank_b == design.rank else None)
         if terms is None:
             continue
-        exposure_scale_b, residual_b, ssr_b = terms
-        residuals_b, outcome_scale_b = _conditioned_outcomes(
+        x_max_b, x_norm_b, residual_b, ssr_b = terms
+        residuals_b, y_max_b, y_norm_b = _conditioned_outcomes(
             design.outcomes[indices], q_b)
-        beta = ((residual_b @ residuals_b / ssr_b)
-                * outcome_scale_b / exposure_scale_b)
+        ratio_b = _scale_ratio(y_max_b, y_norm_b, x_max_b, x_norm_b)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            beta = (residual_b @ residuals_b / ssr_b) * ratio_b
         if not np.all(np.isfinite(beta)):
             raise ValueError(
                 "non-finite pairs bootstrap effects; check input scaling")
@@ -309,8 +325,8 @@ def wild_bootstrap_effects(
                / (ssr * np.sqrt(1 - leverage[:, None])))
     rng = generator(random_state)
     signs = 2 * rng.integers(0, 2, size=(count, design.n), dtype=np.int8) - 1
-    delta = (np.einsum("bn,nt->bt", signs, weights)
-             * (design.outcome_scale / design.exposure_scale))
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        delta = np.einsum("bn,nt->bt", signs, weights) * design.scale_ratio
     boot = design.effect[None, :] + delta
     if not np.all(np.isfinite(boot)):
         raise ValueError(

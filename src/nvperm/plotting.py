@@ -69,16 +69,23 @@ def _level(alpha):
     return level
 
 
-def _intervals(intervals, n):
-    """Validate bootstrap interval endpoints aligned with the features."""
+def _intervals(intervals, expected_effect):
+    """Validate bootstrap interval endpoints aligned with the same fit and outcome order."""
+    n = len(expected_effect)
     low = getattr(intervals, "ci_low", None)
     high = getattr(intervals, "ci_high", None)
-    if low is None or high is None:
-        raise ValueError("intervals must expose ci_low and ci_high arrays")
+    boot_effect = getattr(intervals, "effect", None)
+    if low is None or high is None or boot_effect is None:
+        raise ValueError("intervals must expose effect, ci_low and ci_high arrays")
+    boot_effect = _finite_vector(boot_effect, "intervals.effect", n)
     low = _finite_vector(low, "intervals.ci_low", n)
     high = _finite_vector(high, "intervals.ci_high", n)
     if np.any(low > high):
         raise ValueError("intervals must satisfy ci_low <= ci_high")
+    if not np.allclose(boot_effect, expected_effect, rtol=1e-6, atol=1e-10):
+        raise ValueError(
+            "intervals.effect must match result.effect from the same adjustment model and outcome order"
+        )
     return low, high
 
 
@@ -122,7 +129,9 @@ def plot_adjusted_effects(result: PermutationResult, *, labels: Sequence[str] | 
 
     ``kind='forest'`` draws each adjusted coefficient on the x axis with a
     zero reference line; ``intervals`` adds horizontal bootstrap intervals
-    drawn straight from their endpoints, which may not contain the estimate.
+    drawn straight from their endpoints, which may not contain the estimate,
+    and must come from the same adjustment model and outcome order as
+    ``result`` (verified via ``intervals.effect``).
     ``kind='volcano'`` plots ``-log10`` of the raw p value against the effect.
     Significance uses the familywise max-T p and the BH q value, each at
     ``alpha``; categories share a distinguishable legend. Because inference
@@ -139,7 +148,7 @@ def plot_adjusted_effects(result: PermutationResult, *, labels: Sequence[str] | 
     if intervals is not None:
         if kind != "forest":
             raise ValueError("intervals are supported only for kind='forest'")
-        low, high = _intervals(intervals, n)
+        low, high = _intervals(intervals, effect)
     ax = _axes(ax)
     ax.axvline(0.0, color="#444444", linestyle="--", linewidth=1, zorder=1)
     if kind == "forest":

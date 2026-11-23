@@ -294,3 +294,24 @@ def test_wild_interval_coverage_guard_heteroskedastic():
                                         random_state=seed)
         covers += result.ci_low[0] <= 0.8 <= result.ci_high[0]
     assert 54 <= covers <= repetitions
+
+
+@pytest.mark.parametrize("x_scale", [1e160, 1e-160])
+def test_bootstrap_extreme_exposure_scales_preserve_slope(x_scale):
+    rng = np.random.default_rng(701)
+    n = 24
+    x_unit = np.tile([-1.0, 1.0], n // 2)
+    noise = 0.25 * rng.normal(size=n)
+    y = 2.0 * x_unit + noise
+    x = x_scale * x_unit
+    expected_scale = 1.0 / x_scale
+
+    for fn in (bootstrap_effects, wild_bootstrap_effects):
+        base = fn(y, x_unit, n_resamples=49, random_state=31)
+        scaled = fn(y, x, n_resamples=49, random_state=31)
+        assert np.all(np.isfinite(scaled.effect))
+        assert np.all(np.isfinite(scaled.ci_low))
+        assert np.all(np.isfinite(scaled.ci_high))
+        np.testing.assert_allclose(scaled.effect, base.effect * expected_scale, rtol=1e-12)
+        np.testing.assert_allclose(scaled.ci_low, base.ci_low * expected_scale, rtol=1e-12)
+        np.testing.assert_allclose(scaled.ci_high, base.ci_high * expected_scale, rtol=1e-12)

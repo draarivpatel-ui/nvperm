@@ -131,6 +131,43 @@ def validate_folds(n, fold_ids=None, *, n_splits=5, random_state=42, groups=None
     return folds
 
 
+def _ridge_solve(design, target, penalty):
+    """Solve ridge regression via thin SVD so tiny penalties on rank-deficient designs stay finite."""
+    u, s, vt = np.linalg.svd(design, full_matrices=False)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        factor = np.where(s > 0.0, 1.0 / (s + penalty / s), 0.0)
+    return vt.T @ (factor * (u.T @ target))
+
+
+def _mean_squared_error(residuals):
+    """Compute mean squared error with max-magnitude scaling to prevent sum-of-squares overflow."""
+    r = np.asarray(residuals, dtype=float)
+    if not np.all(np.isfinite(r)):
+        return float("inf")
+    scale = float(np.max(np.abs(r))) if r.size else 0.0
+    if scale == 0.0:
+        return 0.0
+    scaled = r / scale
+    mean_sq = float(np.mean(scaled * scaled))
+    with np.errstate(over="ignore"):
+        return float(scale * (scale * mean_sq))
+
+
+def _mse_difference(base_err, pred_err):
+    """Compute MSE(base_err) - MSE(pred_err) without sum-of-squares overflow."""
+    b = np.asarray(base_err, dtype=float)
+    p = np.asarray(pred_err, dtype=float)
+    if not (np.all(np.isfinite(b)) and np.all(np.isfinite(p))):
+        return float("nan")
+    scale = float(max(np.max(np.abs(b)), np.max(np.abs(p)))) if b.size else 0.0
+    if scale == 0.0:
+        return 0.0
+    bs, ps = b / scale, p / scale
+    mean_diff = float(np.mean((bs - ps) * (bs + ps)))
+    with np.errstate(over="ignore"):
+        return float(scale * (scale * mean_diff))
+
+
 def _check_alpha_grid(alpha_grid):
     """Return a sorted tuple of unique finite positive penalties, or None."""
     if alpha_grid is None:
@@ -229,15 +266,7 @@ class ConnectomePhysiologyCV:
         penalty = self.alpha if alpha is None else alpha
         p = xtrain.shape[1]
         if self.model == "ridge":
-            # The dual form avoids a large edge-by-edge matrix for p > n.
-            if p > len(xtrain):
-                weights = xtrain.T @ np.linalg.solve(
-                    xtrain @ xtrain.T + penalty * np.eye(len(xtrain)), ytrain
-                )
-            else:
-                weights = np.linalg.solve(
-                    xtrain.T @ xtrain + penalty * np.eye(p), xtrain.T @ ytrain
-                )
+            weights = _ridge_solve(xtrain, ytrain, penalty)
             return weights, np.ones(p, dtype=bool)
         df = len(ytrain) - nuisance_rank - 1
         if df < 2:
@@ -249,9 +278,7 @@ class ConnectomePhysiologyCV:
         selected = 2 * student_t.sf(np.abs(tstat), df) <= self.selection_p
         mapping = np.column_stack((selected & (r > 0), selected & (r < 0))).astype(float)
         sums = xtrain @ mapping
-        sum_weights = np.linalg.solve(
-            sums.T @ sums + penalty * np.eye(2), sums.T @ ytrain
-        )
+        sum_weights = _ridge_solve(sums, ytrain, penalty)
         return mapping @ sum_weights, selected
 
     def _inner_folds(self, train, groups):
@@ -284,7 +311,7 @@ class ConnectomePhysiologyCV:
                 weights, _ = self._fit_weights(state["xtr"], state["ytr"],
                                                state["rank"], alpha=alpha)
                 predictions[j, inner_test] = baseline + state["xte"] @ weights
-        scores = np.array([float(np.mean((y - row) ** 2)) for row in predictions])
+        scores = np.array([_mean_squared_error(y - row) for row in predictions])
         if not np.all(np.isfinite(scores)):
             raise ValueError("inner validation MSE is not finite; check input scaling")
         return self.alpha_grid[int(np.argmin(scores))], scores
@@ -347,9 +374,11 @@ class ConnectomePhysiologyCV:
             if inner_folds is not None:
                 cached_state.update(x=x[train], c=c[train])
             cached.append(cached_state)
-        mse = float(np.mean((y - predictions) ** 2))
-        baseline_mse = float(np.mean((y - baseline) ** 2))
-        improvement = baseline_mse - mse
+        mse = _mean_squared_error(y - predictions)
+        baseline_mse = _mean_squared_error(y - baseline)
+        improvement = _mse_difference(y - baseline, y - predictions)
+        if not (np.isfinite(mse) and np.isfinite(baseline_mse) and np.isfinite(improvement)):
+            raise ValueError("outer cross-validation MSE is not finite; check input scaling")
         self.result_ = CVResult(
             predictions, baseline, folds, mse, baseline_mse, improvement,
             float(improvement / baseline_mse) if baseline_mse > 1e-14 else 0.0,
@@ -405,9 +434,13 @@ class ConnectomePhysiologyCV:
                                                   state["rank"], alpha=alpha)
                 base = heldout_basis @ new_scores
                 predicted = base + state["xte"] @ weights
-                scores[b] += np.sum((pseudo_test - base) ** 2 - (pseudo_test - predicted) ** 2) / n
+                fold_diff = _mse_difference(pseudo_test - base, pseudo_test - predicted)
+                scores[b] += (len(test) / n) * fold_diff
         observed = self.result_.mse_improvement
-        tolerance = 1e-10 * max(1, abs(observed))
+        if not (np.isfinite(observed) and np.all(np.isfinite(scores))):
+            raise ValueError("non-finite cross-validation permutation scores; check input scaling")
+        mse_scale = max(abs(observed), self.result_.baseline_mse, self.result_.mse)
+        tolerance = 1e-10 * mse_scale
         pvalue = float((1 + np.count_nonzero(scores >= observed - tolerance)) / (count + 1))
         return CVPermutationResult(
             observed, scores, pvalue, count, self.fold_ids_.copy(), tuple(len(g) for g in cells)
