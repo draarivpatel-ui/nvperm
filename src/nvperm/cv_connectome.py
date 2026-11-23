@@ -1,13 +1,17 @@
 """Training-only nuisance regression, scaling, ridge and signed-network CPM.
 
 Fixed hyperparameters prevent implicit use of held-out scores for tuning.
+When an alpha grid is declared, each outer training set runs an additional
+inner cross-validation over it, so tuning never touches held-out values.
 Permutation tests restrict each shuffle to outer-fold and exchangeability cells,
 fit reduced nuisance models inside each training set, and refit target-dependent
-selection and regression for every null draw.
+selection, tuning and regression for every null draw.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+import numbers
 import numpy as np
 from scipy.stats import t as student_t
 
@@ -33,6 +37,8 @@ class FoldAudit:
     nuisance_basis: np.ndarray
     nuisance_transform: np.ndarray
     nuisance_tolerance: float
+    selected_alpha: float | None = None
+    inner_scores: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,18 +131,47 @@ def validate_folds(n, fold_ids=None, *, n_splits=5, random_state=42, groups=None
     return folds
 
 
+def _check_alpha_grid(alpha_grid):
+    """Return a sorted tuple of unique finite positive penalties, or None."""
+    if alpha_grid is None:
+        return None
+    if isinstance(alpha_grid, (str, bytes)):
+        raise ValueError("alpha_grid must be a sequence of real numbers, not a string")
+    try:
+        values = list(alpha_grid)
+    except TypeError as exc:
+        raise ValueError("alpha_grid must be a sequence of real numbers") from exc
+    grid = []
+    for value in values:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            raise ValueError("alpha_grid values must be real numbers, not bool or text")
+        value = float(value)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("alpha_grid values must be finite and strictly positive")
+        grid.append(value)
+    if not grid:
+        raise ValueError("alpha_grid must contain at least one value")
+    if len(set(grid)) != len(grid):
+        raise ValueError("alpha_grid values must be unique")
+    return tuple(sorted(grid))
+
+
 class ConnectomePhysiologyCV:
     """Out-of-fold connectome prediction with auditable training state.
 
     Confounds are numeric; encode site using declared reference categories.
     ``model='partial_correlation'`` selects positive and negative edges using
     training partial-correlation p values and fits ridge to their two sums.
-    Alpha and selection thresholds are fixed before evaluation. Nested tuning
-    is intentionally left to a caller-provided training-only procedure.
+    ``alpha`` fixes the ridge penalty. ``alpha_grid`` instead tunes it inside
+    each outer training set with ``inner_splits``-fold cross-validation, so no
+    held-out subject influences selection; an exact tie takes the smallest
+    grid value.
     """
 
     def __init__(self, n_splits=5, *, alpha=10.0, model="ridge",
-                 selection_p=0.05, random_state=42):
+                 selection_p=0.05, random_state=42,
+                 alpha_grid: Sequence[float] | None = None,
+                 inner_splits: int = 3):
         self.n_splits = positive_integer(n_splits, "n_splits", 2)
         if not np.isfinite(alpha) or alpha <= 0:
             raise ValueError("alpha must be finite and strictly positive")
@@ -146,22 +181,62 @@ class ConnectomePhysiologyCV:
             raise ValueError("selection_p must lie in (0, 1]")
         self.alpha, self.model = float(alpha), model
         self.selection_p, self.random_state = float(selection_p), random_state
+        self.inner_splits = positive_integer(inner_splits, "inner_splits", 2)
+        self.alpha_grid = _check_alpha_grid(alpha_grid)
 
     def _folds(self, n, fold_ids, groups):
         return validate_folds(n, fold_ids, n_splits=self.n_splits,
                               random_state=self.random_state, groups=groups)
 
-    def _fit_weights(self, xtrain, ytrain, nuisance_rank):
+    def _transform(self, x, y, c, x_eval, c_eval):
+        """Fit nuisance and feature transforms on one training subset.
+
+        All estimates come from the training rows passed in ``x``, ``y`` and
+        ``c``; ``x_eval`` and ``c_eval`` are only projected through them.
+        Returns the pieces shared by outer folds, inner tuning folds and
+        permutation refits.
+        """
+        cmean = c.mean(axis=0)
+        cscale = c.std(axis=0)
+        cscale = np.where(cscale > 0, cscale, 1)
+        train_design = np.column_stack((np.ones(len(c)), (c - cmean) / cscale))
+        eval_design = np.column_stack((np.ones(len(c_eval)), (c_eval - cmean) / cscale))
+        q, transform, tolerance = nuisance_svd(train_design)
+        rank = q.shape[1]
+        if len(x) - rank < 3:
+            raise ValueError("training nuisance design leaves too few residual degrees of freedom")
+        heldout_basis = eval_design @ transform
+        scoresx, scoresy = q.T @ x, q.T @ y
+        xtr = x - q @ scoresx
+        xte = x_eval - heldout_basis @ scoresx
+        ytr = y - q @ scoresy
+        mean, scale = xtr.mean(axis=0), xtr.std(axis=0)
+        precision = 100 * np.finfo(float).eps * np.maximum(
+            np.max(np.abs(x), axis=0), np.finfo(float).tiny
+        )
+        scale = np.where(scale > precision, scale, 1)
+        return {
+            "confound_mean": cmean, "confound_scale": cscale,
+            "q": q, "transform": transform, "tolerance": tolerance, "rank": rank,
+            "heldout_basis": heldout_basis, "scoresx": scoresx, "scoresy": scoresy,
+            "feature_nuisance_coef": transform @ scoresx,
+            "target_nuisance_coef": transform @ scoresy,
+            "xtr": (xtr - mean) / scale, "xte": (xte - mean) / scale,
+            "ytr": ytr, "feature_mean": mean, "feature_scale": scale,
+        }
+
+    def _fit_weights(self, xtrain, ytrain, nuisance_rank, *, alpha=None):
+        penalty = self.alpha if alpha is None else alpha
         p = xtrain.shape[1]
         if self.model == "ridge":
             # The dual form avoids a large edge-by-edge matrix for p > n.
             if p > len(xtrain):
                 weights = xtrain.T @ np.linalg.solve(
-                    xtrain @ xtrain.T + self.alpha * np.eye(len(xtrain)), ytrain
+                    xtrain @ xtrain.T + penalty * np.eye(len(xtrain)), ytrain
                 )
             else:
                 weights = np.linalg.solve(
-                    xtrain.T @ xtrain + self.alpha * np.eye(p), xtrain.T @ ytrain
+                    xtrain.T @ xtrain + penalty * np.eye(p), xtrain.T @ ytrain
                 )
             return weights, np.ones(p, dtype=bool)
         df = len(ytrain) - nuisance_rank - 1
@@ -175,11 +250,57 @@ class ConnectomePhysiologyCV:
         mapping = np.column_stack((selected & (r > 0), selected & (r < 0))).astype(float)
         sums = xtrain @ mapping
         sum_weights = np.linalg.solve(
-            sums.T @ sums + self.alpha * np.eye(2), sums.T @ ytrain
+            sums.T @ sums + penalty * np.eye(2), sums.T @ ytrain
         )
         return mapping @ sum_weights, selected
 
+    def _inner_folds(self, train, groups):
+        """Generate the cached inner split of one outer training subset.
+
+        Only training row positions and their group labels are used, so
+        held-out values and labels never shape the tuning folds.
+        """
+        inner_groups = None if groups is None else np.asarray(groups)[train]
+        return make_folds(len(train), self.inner_splits,
+                          random_state=self.random_state, groups=inner_groups)
+
+    def _select_alpha(self, x, y, c, inner_folds):
+        """Tune alpha on an outer training subset and return (alpha, scores).
+
+        ``x``, ``y`` and ``c`` hold training rows only; each inner fold refits
+        the shared transformation on its own training rows. A candidate's
+        score is the pooled inner-validation sum of squared errors divided by
+        the outer training count, so unequal inner folds weight each subject
+        equally rather than each fold equally. Scores are returned in
+        ascending grid order and an exact tie selects the smallest alpha.
+        """
+        predictions = np.empty((len(self.alpha_grid), len(y)))
+        for fold in np.unique(inner_folds):
+            inner_train, inner_test = inner_folds != fold, inner_folds == fold
+            state = self._transform(x[inner_train], y[inner_train], c[inner_train],
+                                    x[inner_test], c[inner_test])
+            baseline = state["heldout_basis"] @ state["scoresy"]
+            for j, alpha in enumerate(self.alpha_grid):
+                weights, _ = self._fit_weights(state["xtr"], state["ytr"],
+                                               state["rank"], alpha=alpha)
+                predictions[j, inner_test] = baseline + state["xte"] @ weights
+        scores = np.array([float(np.mean((y - row) ** 2)) for row in predictions])
+        if not np.all(np.isfinite(scores)):
+            raise ValueError("inner validation MSE is not finite; check input scaling")
+        return self.alpha_grid[int(np.argmin(scores))], scores
+
     def fit(self, features, target, confounds=None, *, fold_ids=None, groups=None):
+        """Fit each outer fold and record its auditable training state.
+
+        With ``alpha_grid`` set, every outer training set first runs the inner
+        search described by :meth:`_select_alpha`; the price is roughly
+        ``inner_splits * len(alpha_grid)`` extra refits per outer fold, and the
+        same retuning repeats inside every permutation draw. Inner folds are
+        created once per outer training subset and reused for the whole run.
+        When ``groups`` are supplied, inner folds keep those group boundaries
+        intact, which requires every outer training subset to contain at least
+        ``inner_splits`` independent groups.
+        """
         x = matrix(features, "features")
         n = len(x)
         if x.shape[1] == 0:
@@ -191,37 +312,41 @@ class ConnectomePhysiologyCV:
         audits, cached = [], []
         for fold in np.unique(folds):
             train, test = np.flatnonzero(folds != fold), np.flatnonzero(folds == fold)
-            cmean = c[train].mean(axis=0)
-            cscale = c[train].std(axis=0)
-            cscale = np.where(cscale > 0, cscale, 1)
-            ctr = np.column_stack((np.ones(len(train)), (c[train] - cmean) / cscale))
-            cte = np.column_stack((np.ones(len(test)), (c[test] - cmean) / cscale))
-            q, transform, tolerance = nuisance_svd(ctr)
-            rank = q.shape[1]
-            if len(train) - rank < 3:
-                raise ValueError("training nuisance design leaves too few residual degrees of freedom")
-            heldout_basis = cte @ transform
-            scoresx, scoresy = q.T @ x[train], q.T @ y[train]
-            coefx, coefy = transform @ scoresx, transform @ scoresy
-            xtr = x[train] - q @ scoresx
-            xte = x[test] - heldout_basis @ scoresx
-            ytr = y[train] - q @ scoresy
-            mean, scale = xtr.mean(axis=0), xtr.std(axis=0)
-            precision = 100 * np.finfo(float).eps * np.maximum(np.max(np.abs(x[train]), axis=0), np.finfo(float).tiny)
-            scale = np.where(scale > precision, scale, 1)
-            xtr, xte = (xtr - mean) / scale, (xte - mean) / scale
-            weights, selected = self._fit_weights(xtr, ytr, rank)
-            baseline[test] = heldout_basis @ scoresy
-            predictions[test] = baseline[test] + xte @ weights
+            inner_folds, inner_scores = None, ()
+            if self.alpha_grid is not None:
+                inner_folds = self._inner_folds(train, groups)
+                alpha, scores = self._select_alpha(x[train], y[train], c[train], inner_folds)
+                inner_scores = tuple(
+                    (float(a), float(s)) for a, s in zip(self.alpha_grid, scores)
+                )
+            else:
+                alpha = self.alpha
+            state = self._transform(x[train], y[train], c[train], x[test], c[test])
+            if self.alpha_grid is None:
+                weights, selected = self._fit_weights(state["xtr"], state["ytr"], state["rank"])
+            else:
+                weights, selected = self._fit_weights(state["xtr"], state["ytr"],
+                                                      state["rank"], alpha=alpha)
+            baseline[test] = state["heldout_basis"] @ state["scoresy"]
+            predictions[test] = baseline[test] + state["xte"] @ weights
             audits.append(FoldAudit(
-                train.copy(), test.copy(), cmean.copy(), cscale.copy(), coefx.copy(),
-                coefy.copy(), mean.copy(), scale.copy(), weights.copy(), selected.copy(), rank,
-                q.copy(), transform.copy(), tolerance,
+                train.copy(), test.copy(), state["confound_mean"].copy(),
+                state["confound_scale"].copy(), state["feature_nuisance_coef"].copy(),
+                state["target_nuisance_coef"].copy(), state["feature_mean"].copy(),
+                state["feature_scale"].copy(), weights.copy(), selected.copy(),
+                state["rank"], state["q"].copy(), state["transform"].copy(),
+                state["tolerance"], selected_alpha=float(alpha),
+                inner_scores=inner_scores,
             ))
             # No cached fitting operation depends on held-out values or targets.
-            cached.append({"train": train, "test": test, "q": q,
-                           "heldout_basis": heldout_basis, "xtr": xtr, "xte": xte,
-                           "scoresy": scoresy, "rank": rank})
+            cached_state = {"train": train, "test": test, "q": state["q"],
+                            "heldout_basis": state["heldout_basis"],
+                            "xtr": state["xtr"], "xte": state["xte"],
+                            "scoresy": state["scoresy"], "rank": state["rank"],
+                            "inner_folds": inner_folds}
+            if inner_folds is not None:
+                cached_state.update(x=x[train], c=c[train])
+            cached.append(cached_state)
         mse = float(np.mean((y - predictions) ** 2))
         baseline_mse = float(np.mean((y - baseline) ** 2))
         improvement = baseline_mse - mse
@@ -244,6 +369,10 @@ class ConnectomePhysiologyCV:
         approximation inherits Freedman-Lane exchangeability assumptions.
         Grouped CV controls train/test isolation; dependent subjects additionally
         require valid exchangeability blocks, rather than unrestricted shuffles.
+        When ``alpha_grid`` was configured, each pseudo dataset repeats the
+        inner tuning on its pseudo outer-training target with the cached inner
+        fold assignments, so the null carries the tuning step instead of
+        inheriting the observed alpha; pseudo held-out targets never enter it.
         """
         if not hasattr(self, "result_"):
             raise ValueError("fit the model before requesting a permutation test")
@@ -267,7 +396,13 @@ class ConnectomePhysiologyCV:
                 pseudo_test = reduced[test] + residuals[index[test]]
                 new_scores = q.T @ pseudo_train
                 ytrain = pseudo_train - q @ new_scores
-                weights, _ = self._fit_weights(state["xtr"], ytrain, state["rank"])
+                if state["inner_folds"] is None:
+                    weights, _ = self._fit_weights(state["xtr"], ytrain, state["rank"])
+                else:
+                    alpha, _ = self._select_alpha(state["x"], pseudo_train,
+                                                  state["c"], state["inner_folds"])
+                    weights, _ = self._fit_weights(state["xtr"], ytrain,
+                                                  state["rank"], alpha=alpha)
                 base = heldout_basis @ new_scores
                 predicted = base + state["xte"] @ weights
                 scores[b] += np.sum((pseudo_test - base) ** 2 - (pseudo_test - predicted) ** 2) / n
@@ -277,4 +412,3 @@ class ConnectomePhysiologyCV:
         return CVPermutationResult(
             observed, scores, pvalue, count, self.fold_ids_.copy(), tuple(len(g) for g in cells)
         )
-

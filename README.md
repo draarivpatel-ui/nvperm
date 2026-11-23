@@ -64,19 +64,25 @@ Westfall-Young single-step max-T compares each observed oriented statistic again
 
 At B Monte Carlo draws the smallest probability is 1/(B+1). For sparse BH discoveries among m targets, plan enough draws to resolve the threshold 0.05/m. The short benchmark uses max-T because 199 draws cannot resolve an isolated BH discovery among 66 edges.
 
+## Bootstrap intervals
+
+Use `bootstrap_effects(y, x, covariates, blocks=site)` for pointwise percentile intervals on the same adjusted coefficients as Freedman-Lane. It resamples complete participant rows with replacement and preserves the number of rows in each stratum. Strata are not dependent clusters. The result reports both requested and estimable resample counts. If some designs are not estimable, it warns that the interval conditions on the retained draws.
+
+Use `wild_bootstrap_effects(y, x, covariates)` as a fixed-design sensitivity check when error variance may differ across independent participants. It applies a shared random sign to each participant's leverage-adjusted residuals and returns pointwise basic intervals. Neither method computes a p value, a simultaneous interval or a cluster bootstrap.
+
 ## Cross-validation and permutation boundaries
 
 Every outer fold fits confound normalization, feature nuisance coefficients, target nuisance coefficients, feature scaling and regression weights on its training subjects. Test rows are only transformed and scored. `fold_audits_` exposes the stored training state. Tests change held-out targets, features and confounds and prove that the corresponding training weights stay identical.
 
 Nuisance regression uses one explicit SVD cutoff of machine precision times the larger training-design dimension times its largest singular value. The retained orthonormal basis controls training projections, reported nuisance rank and screening degrees of freedom. Held-out transformations and null refits use those same retained directions. Fold audits also expose the basis, coefficient map and absolute cutoff.
 
-Ridge uses a fixed positive alpha and a dual solve when the edge count exceeds the training subject count. The partial-correlation model screens edges inside each training fold, constructs positive and negative edge sums, and fits ridge to those sums. It follows the structure of connectome predictive modeling while adding explicit nuisance and fold boundaries. Hyperparameters are fixed before evaluation. Select them with a nested training-only procedure if tuning is needed.
+Ridge uses a fixed positive alpha and a dual solve when the edge count exceeds the training subject count. The partial-correlation model screens edges inside each training fold, constructs positive and negative edge sums, and fits ridge to those sums. It follows the structure of connectome predictive modeling while adding explicit nuisance and fold boundaries. Use `alpha_grid=(0.5, 2.0, 10.0)` and `inner_splits=3` to select a penalty by pooled inner validation MSE, with the smallest penalty breaking an exact tie. Each inner split refits preprocessing and any edge selection using its training rows only. An outer fold audit records `selected_alpha` and `inner_scores`. The default `alpha_grid=None` still uses fixed `alpha`.
 
 Prediction includes a demographics/confounds baseline. Report the baseline MSE, full-model MSE and their difference. A large raw prediction correlation can come entirely from age or site. Residual prediction correlation is also available.
 
-`permutation_test` uses reduced nuisance fits from each training set and restricts permutations to the intersection of outer-fold and declared exchangeability labels. It refits the target nuisance model, edge selection and regression for every null draw. Training and held-out targets never cross during a shuffle. The score is baseline MSE minus full-model MSE. This conditional procedure inherits the approximate nature and exchangeability assumptions of residual permutation inference.
+`permutation_test` uses reduced nuisance fits from each training set and restricts permutations to the intersection of outer-fold and declared exchangeability labels. It refits the target nuisance model, edge selection and regression for every null draw. If an alpha grid is supplied, it also retunes the penalty using the same inner splits and the resampled training targets. Training and held-out targets never cross during a shuffle. The score is baseline MSE minus full-model MSE. This conditional procedure inherits the approximate nature and exchangeability assumptions of residual permutation inference.
 
-For family or repeated-measure data, `groups` keeps independent units together during CV. The permutation engine supports shuffles within declared blocks, not whole-block exchanges or wild bootstrap tests. Choose blocks using the study design. A singleton cell admits no nontrivial shuffle.
+For family or repeated-measure data, `groups` keeps units together in outer and inner CV splits. The permutation engine supports shuffles within declared blocks, not whole-block exchanges. Grouped folds do not by themselves justify a permutation or bootstrap. Choose blocks using the study design. A singleton cell admits no nontrivial shuffle.
 
 ## Coupling features
 
@@ -85,6 +91,12 @@ For family or repeated-measure data, `groups` keeps independent units together d
 `pulse_pressure` returns systolic minus diastolic pressure in mmHg. `rmssd` computes successive accepted NN-interval differences and returns milliseconds. It requires prior artifact review and performs no ECG peak detection. `neurovascular_features` appends physiology and raw segregation interactions without fitting a cohort-wide scaler. `motion_sensitivity` compares adjusted correlations before and after FD control and can run both corresponding permutation tests. Attenuation describes sensitivity to an added confound; it is not causal evidence.
 
 When predicting pulse pressure, exclude `pulse_pressure_mmhg` and all `_x_pulse_pressure` columns from `neurovascular_features`. When predicting RMSSD, exclude `rmssd_ms` and all `_x_rmssd` columns. Remove every predictor derived from the outcome before CV. Training-only preprocessing cannot repair a predictor that contains the target.
+
+## Plots and tutorial
+
+Install `.[plot]` to use the Matplotlib helpers. `plot_adjusted_effects` marks max-T and BH results in a forest or volcano view and can show pointwise intervals in the forest view. `plot_cv_predictions` compares nuisance-only and full out-of-fold predictions against the observed target. Both return an axes object without showing or saving the figure.
+
+Run `python examples/neurovascular_workflow_tutorial.py` for a synthetic worked example from coupling features through inference, nested CV and motion sensitivity. Add `--output-dir figures` to write the two plots.
 
 ## CLI
 

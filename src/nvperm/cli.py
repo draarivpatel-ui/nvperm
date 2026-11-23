@@ -12,6 +12,7 @@ import zlib
 import numpy as np
 from numpy.lib.npyio import NpzFile
 
+from . import __version__
 from ._utils import label_groups, matrix, vector
 from .benchmark import plot_benchmark, run_benchmark, write_benchmark_csv
 from .cv_connectome import ConnectomePhysiologyCV, validate_folds
@@ -51,7 +52,7 @@ def _load(path):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="nvperm", description=__doc__)
-    parser.add_argument("--version", action="version", version="nvperm 0.1.0")
+    parser.add_argument("--version", action="version", version=f"nvperm {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="Permutation inference and out-of-fold prediction from NPZ")
     run.add_argument("--input", required=True, type=Path)

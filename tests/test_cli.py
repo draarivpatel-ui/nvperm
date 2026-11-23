@@ -1,14 +1,13 @@
 import csv
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import zipfile
 import numpy as np
 import pytest
 
-from nvperm import generate_cohort
+from nvperm import __version__, generate_cohort
 from nvperm.cli import main
 from nvperm.benchmark import run_benchmark, write_benchmark_csv
 
@@ -224,7 +223,7 @@ def test_cli_help_and_version(capsys):
     with pytest.raises(SystemExit) as version:
         main(["--version"])
     assert version.value.code == 0
-    assert "0.1.0" in capsys.readouterr().out
+    assert capsys.readouterr().out == f"nvperm {__version__}\n"
 
 
 def test_benchmark_is_deterministic_except_timing():

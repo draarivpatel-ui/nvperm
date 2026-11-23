@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvperm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Covariate-adjusted permutation inference and fold-isolated connectome modeling"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,9 @@ nvperm = "nvperm.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nvperm = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
